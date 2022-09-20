@@ -1,0 +1,673 @@
+---
+title: "Example 1: Scat classification"
+author: "Luke Yates"
+date: "24/01/2022"
+bibliography: bib_cv_primer.bib
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse); library(tidymodels); library(kableExtra); library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+select <- dplyr::select
+options(na.action = "na.fail") # for MuMIn::dredge
+```
+## Overview
+This page is part of a [code repository](https://github.com/l-a-yates/CVReview) to reproduce the example analyses in the manuscript  "Cross validation for model selection: a primer with examples from ecology" by L.A. Yates, Z. Aandahl, S.A.Richards, and B.W.Brook (2022). This tutorial is designed to be used alongside the manuscript.  
+
+The `scat` dataset is sourced from the R package `caret`. @Reid2015 collected animal feces in coastal California. The data consist of DNA verified species designations as well as fields related to the time and place of the collection and the morphology of the scat itself. In this example, the aim of the analysis is to predict the biological family (*felid* or *canid*) for each scat observation, based on eight morphological characteristics, the scat location, and the carbon-to-nitrogen ratio (see Table 1 of the original data publication for variable descriptions). 
+
+## Load and prepare scat data
+
+Data preparations include: collapsing the response from three categories to two (i.e. binary classification), centering and scaling numerical predictors, and log-transforming two of the variables (based on advice in the original publication). 
+
+
+```{r}
+data(scat,package = "caret")
+
+prep_data <- function(data){
+  data %>% as_tibble %>% 
+    select(y = Species, Number, Length, Diameter, Taper, TI, Mass, CN, Location, ropey, segmented) %>% 
+    rename_with(str_to_lower) %>% # TI: taper index
+    mutate(across(c(mass,cn),log)) %>% # following original data publication
+    mutate(number = as.double(number)) %>% 
+    drop_na() %>% 
+    mutate(across(where(is_double), ~ .x %>% scale %>% as.numeric)) %>% # centre and scale predictors
+    mutate(y = fct_collapse(y, canid = c("coyote","gray_fox"), felid = c("bobcat")) %>% 
+             fct_relevel("canid","felid"),
+           location = fct_collapse(location, mid = c("middle"), edge = c("edge","off_edge")) %>% 
+             factor(labels = c(0,1))) %>% 
+    mutate(across(c(ropey,segmented), factor))
+}
+
+scat <- prep_data(scat) # N.B. fail = canid (factor-level 1), success = felid (factor-level 2)
+vars <- names(scat %>% select(-y))
+scat
+```
+
+
+```{r, out.width="50%"}
+scat %>% select(where(is_double)) %>% cor %>% corrplot::corrplot(method =c("number"))
+```
+
+
+
+## Part 1A: logistic regression using MCC (discrete selection)
+
+In this part, we perform exhaustive model selection, fitting all 1024 possible combinations of predictors. The models are Bernoulli-distributed generalized linear models ($\texttt{logit}$ link), fit using maximum likelihood via the base function `glm`. Model performance is compared using Matthew's correlation coefficient (MCC). To mitigate against overfitting, the modified one-standard-error (OSE) rule is applied to select a preferred model.  
+
+### Generate list of model formulas and dimensions
+We use the `MuMIn` package to generate the model formulas:
+```{r, message=FALSE}
+forms_all <- glm(y~., data = scat, family = binomial) %>% MuMIn::dredge(evaluate = F) %>% map(as.formula)
+dim_all <- forms_all %>% map_dbl(~ .x %>% terms %>% attr("variables") %>% {length(.)-2})
+```
+For example, the tenth model is 
+```{r}
+forms_all[[10]]
+```
+
+### Creating a confusion matrix and computing MCC
+The predictive performance of a binary (two-class) classifier can be summarised as a $2\times2$ matrix called a confusion matrix. Labeling one class  positive  and  the  other  negative, the  matrix entries are the counts of the four prediction outcomes: true positives (TP), false positives   (FP), false negatives (FN), and true negatives(TN):    
+\[\left(\begin{array}{cc}\mathrm{TP}&\mathrm{FP}\\\mathrm{FN}&\mathrm{TN}\end{array}\right)\]
+
+MCC is computed from the entries of a confusion matrix, taking values between $-1$ and $+1$, where +1 indicates perfect prediction, 0.0 means the prediction is no better than random, and −1 indicates the worst prediction possible:
+\[\mathrm{MCC} = \frac{TP\cdot TN - FP\cdot FN}{\sqrt{(TP+FP)(TP+FN)(TN+FP)(TN+FN)}}\]
+
+A confusion matrix is easily generated from the predictions of fitted model object, but care must be taken to place the TP in the top left (this does not affect symmetric metrics like MCC). Using the prevalance as a probability threshold equal to determine the response category (logistic regression models class probabilities), a confusion matrix can be computed as follows:
+```{r}
+fit <- glm(forms_all[[10]],binomial, scat)
+# compute prevalance for the threshold
+thresh <- scat %>% pull(y) %>% {.=="felid"} %>% {sum(.)/length(.)} # 0.549
+# re-order levels so that TRUE (1) precedes FALSE (0)
+pred <- as.numeric(predict(fit,type= "response")>=thresh)%>% factor(levels = c(1,0))
+obs <- as.numeric(fit$data$y!=levels(fit$data$y)[1]) %>% factor(levels = c(1,0))
+cm <- tibble(pred,obs) %>% table
+cm
+```
+Now we define a function to compute MCC:
+```{r}
+# computes MCC from a confusion matrix `cm`
+mcc <- function(cm){
+  (cm[1,1]*cm[2,2] - cm[1,2]*cm[2,1])/
+    (sqrt((cm[1,1]+cm[1,2])*(cm[1,1]+cm[2,1])*(cm[2,2]+cm[1,2])*(cm[2,2]+cm[2,1])))
+}
+
+mcc(cm)
+```
+
+### Using cross validation to estimate predictive MCC
+
+So far we have computed an MCC estimate using within sample data. To obtain an out-of-sample or predictive estimate of MCC we use repeated $k$-fold CV. For each repeat, we generate a single confusion matrix and corresponding MCC estimate. We use the `rsample` package (part of the `tidymodels` package set) to perform the data splitting: $10$-fold CV, repeated 50 times. 
+```{r}
+set.seed(770); cv_data_1 <- vfold_cv(scat,10,50) %>% mutate(thresh = thresh)
+cv_data_1
+```
+The returned rsample object is a tibble and we add a column to store probability threshold (here fixed to $0.5$, but we will allow it be tuned in a subsequent analysis). The column `splits` contains $500$ ($10\times50$) splits of the original data. For each split, the test and training data can be extracted using the functions `analysis` and `split`, respectively. For example:
+
+```{r}
+split <- cv_data_1$splits[[1]] # take the 1st of 500 splits
+analysis(split)
+assessment(split)
+```
+
+The following function takes a repeated $k$-fold rsample object, a model formula, and a metric (e.g., MCC) and returns a tibble containing a metric estimate for each $k$-fold repeat. 
+
+```{r}
+fit_confusion_glm <- function(cv_data, formula = NULL, metric){
+  get_confusion_matrix <- function(form, split, thresh){
+    glm(form, data = analysis(split), family = binomial()) %>% 
+      {tibble(pred = predict(.,newdata = assessment(split), type = "response") >= thresh, 
+              y = assessment(split)$y != levels(assessment(split)$y)[1])} %>% 
+      mutate(across(everything(), ~ .x %>% as.numeric() %>% factor(levels = c(1,0)))) %>% 
+      table %>% {c(tp = .[1,1], fp = .[1,2], fn = .[2,1], tn = .[2,2])}
+  }
+  if(!is.null(formula)) form <- list(formula) else form <- cv_data$form_glm
+  with(cv_data, mapply(get_confusion_matrix, form, splits, thresh, SIMPLIFY = T)) %>% t %>% 
+    as_tibble %>% 
+    bind_cols(rep = cv_data$id, .) %>% 
+    group_by(rep) %>% 
+    summarise(metric = matrix(c(sum(tp),sum(fn),sum(fp),sum(tn)),2,2) %>% metric) %>% 
+    mutate(rep = 1:n())
+}
+
+
+```
+
+For example, applying the function to one of the models gives:
+```{r}
+mcc_f10 <- fit_confusion_glm(cv_data_1, forms_all[[10]],mcc)
+mcc_f10
+mcc_f10 %>% pull(metric) %>% {c(mean = mean(.), sd = sd(.))}
+```
+
+### Model selection using the modified OSE rule
+
+We estimate MCC for all 1024 models using the repeated $k$-fold data-splitting scheme created above.
+
+```{r, include = FALSE}
+mcc_est <- readRDS("files_scat/mcc_dredge_2022_08_15.rds") %>% bind_cols()
+```
+```{r, eval=FALSE}
+mcc_est <- pbmclapply(forms_all, function(form) fit_confusion_glm(cv_data_1,form, mcc)$metric, mc.cores = 40) %>% bind_cols() # (220 seconds using 40 cores)
+```
+
+The following function takes the repeated CV MCC estimates and computes the following summary statistics for each model: the mean MCC; the standard error of the MCC ($\sigma_m$), standard error of the MCC difference with respect to the best model ($\sigma_m^{{\mathrm{diff}}}$), and the modified standard error ($\sigma_m^{{\mathrm{adj}}}$) (see manuscript for definitions): 
+
+```{r, eval = TRUE}
+# computes summary statistics for model score estimates
+make_plot_data <- function(metric_data, levels){
+  best_model <- metric_data %>% map_dbl(mean) %>% which.max() %>% names()
+  tibble(model = factor(names(metric_data), levels = levels), 
+         metric = metric_data %>% map_dbl(mean),
+         se = metric_data %>% map_dbl(sd),
+         se_diff = metric_data %>% map(~ .x - metric_data[[best_model]]) %>% map_dbl(sd),
+         se_mod = sqrt(1 -cor(metric_data)[best_model,])*se[best_model])
+}
+
+```
+We apply the function to the MCC estimates and filter the results to select only the best performing model at each dimension (i.e., number of model parameters)
+```{r}
+
+
+metric_summary <- make_plot_data(mcc_est, levels = names(mcc_est)) %>% mutate(dim = dim_all)
+
+metric_by_dim <- metric_summary %>% 
+  group_by(dim) %>% 
+  arrange(-metric) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  arrange(dim) %>% 
+  filter(!dim %in% c(0,9)) # reduce model set to be plotted
+
+```
+Finally, we apply the modified OSE rule by determining the least complex model whose mean MCC estimate lies within $\sigma_m^{{\mathrm{adj}}}$ of the best estimate. We plot the results.
+```{r, out.width="80%"}
+best_mod_ose_dim <- metric_by_dim %>% 
+  filter(metric + se_mod >= max(metric)) %>% 
+  filter(dim == min(dim)) %>% pull(dim)
+
+# main plot for scat example in manuscript
+metric_by_dim %>% 
+  ggplot(aes(factor(dim, levels = dim))) +
+    geom_linerange(aes(ymin = metric - se_mod, ymax = metric + se_mod), col = "black") +
+    geom_point(aes(y = metric), size = 2) +
+    theme_classic() +
+    geom_point(aes(y = metric), shape = 1, size = 6, col = "black", 
+               data = ~ .x %>% filter(dim == best_mod_ose_dim)) + # circle the OSE-preferred model
+    labs(subtitle = "CV estimates for scat models", x = "Number of parameters",y = "MCC")
+
+```  
+
+
+The model with two predictors is identified using the modified OSE rule, but we can see that the one-predictor model is very close to being selected. The corresponding model formulas at each dimension are:
+```{r}
+forms_all[metric_by_dim$model]
+```
+
+## Part 1B: logistic regression using MCC (penalised regression)
+
+As an alternative to discrete selection, we take the global logistic model and use penalised regression to shrink or regularise the parameter estimates. We use elastic net regression which comprises a family of penalised regression models, index by a hyperparameter $\alpha$, $0\leq\alpha\leq1$, for which the extreme values $\alpha = 0$ and $\alpha=1$ correspond to LASSO (least absolute shrinkage and selection operator) and ridge regression, respectively. The LASSO is able shrink some parameter estimates to zero, performing effective variable selection, whereas ridge regression shrinks all parameters towards, but never attaining, zero. Mathematically, the regularised parameters $\widehat{\boldsymbol\theta} =(\widehat\theta_1,\widehat\theta_2,...,\widehat\theta_p)$ are those minimising the penalised function
+
+\begin{equation}
+\label{eq:elastic_net}
+f(\mathbf{x};\mathbf{\boldsymbol{\widehat\theta}}) + \lambda\left(\alpha||\boldsymbol{\widehat\theta}||^1 + \frac{(1-\alpha)}{2}||\boldsymbol{\widehat\theta}||^2\right),
+\end{equation}
+
+where $f$ is the objective function (usually mean squared error or negative log density), and $||\boldsymbol\theta||^1 = \sum_{j=1}^p |\theta_j|$ and $||\boldsymbol\theta||^2 = \sum_{j=1}^p \theta_j^2$ are the $L_1$- and $L_2$-norm of the vector of model parameters, respectively. The regularisation parameter $\lambda$ determines the strength of the penalty, implementing a trade-off between the size of the model's parameter estimates (the shrinkage or effective complexity) and the minimised value of the (unconstrained) objective function $f$.
+
+### Load package and perform an initial fit
+Elastic net regression is implemented in the R package `glmnet`. The main CV fitting function accepts a fixed value of $\alpha$ (`alpha`), the GLM specification for the global model, the number of folds, and the loss function or measure to be cross validated (`type.measure`, five options available). A vector of candidate values of the regularisation parameter $\lambda$ (`lambda`) can be supplied, otherwise a default set is generated. For example:
+```{r, message=FALSE}
+library(glmnet)
+
+fit.net <- cv.glmnet(x = scat %>% select(-y) %>% as.data.frame() %>% makeX(), 
+                     y = scat %>% pull(y), 
+                     family = "binomial", 
+                     folds = 10,
+                     type.measure = "class", # misclassification loss
+                     alpha = 1) # lasso
+fit.net %>% plot
+fit.net$glmnet.fit %>% plot(xvar = "lambda")
+
+```  
+<br><br><br>
+
+### Penalised LASSO using MCC
+
+Unfortunately, it is not possible to use a custom-defined loss function in `glmnet`, but with a little effort we can still use the package to perform penalised regression for our chosen metric: MCC. 
+
+We start by defining a function to compute the predictive confusion matrix across a supplied range of $\lambda$ values for a given `rsample` split.
+
+```{r}
+# compute out-sample-sample (i.e., CV) confusion-matrix entries for all lambda values for a given split
+get_cm <- function(split, rep, fold, alpha, lambda, thresh){
+  glmnet(x = analysis(split) %>% select(-y) %>% as.data.frame() %>% makeX(),
+         y = analysis(split) %>% pull(y),
+         family = "binomial",
+         alpha = alpha,
+         lambda = lambda) %>% 
+    predict(newx = assessment(split) %>% select(-y) %>% as.data.frame() %>% makeX(),
+            type = "response") %>%
+    as_tibble %>% 
+    rename_with(~str_remove(.x,stringr::fixed("s"))) %>% 
+    imap_dfr(~ tibble(y_pred = as.numeric(.x > thresh), 
+                 y = assessment(split) %>% pull(y) %>% as.numeric() %>% {.-1},
+                 tp = as.numeric(y==1 & y_pred==1),
+                 fp = as.numeric(y==0 & y_pred==1),
+                 fn = as.numeric(y==1 & y_pred==0),
+                 tn = as.numeric(y==0 & y_pred==0),
+                 rep = rep, fold = fold, lambda = lambda[as.numeric(.y)+1]))
+}
+
+```
+
+For lasso (`alpha = 1`), we specify (after a little trial and error) the following sequence of candidate $\mathrm{log}\,\lambda$ values:
+
+```{r}
+log_lambda_lasso <- seq(-1.6,-4, length.out = 100)
+```
+
+and we compute the confusion matrices over all $\lambda$ for the full set of splits `cv_data_1` used in the previous analysis. 
+
+```{r, include = FALSE}
+cm_lasso <- readRDS("files_scat/cm_lasso_2022_08_29.rds")
+```
+```{r, eval = FALSE}
+# compute confusion-matrix entries and aggregate across folds within a given repetition
+# 2 seconds with 40 cores
+cm_lasso <- pbmclapply(1:nrow(cv_data_1), 
+                       function(i) get_cm(cv_data_1$splits[[i]], cv_data_1$id[[i]], cv_data_1$id2[[i]], 
+                                          alpha = 1, 
+                                          lambda = exp(log_lambda_lasso),
+                                          thresh = thresh),
+                       mc.cores = 40) %>% 
+  bind_rows() %>% as_tibble() 
+```
+ Within each repetition and $\lambda$ value, we sum the confusion-matrix entries and compute MCC:
+```{r}
+mcc_lasso <- cm_lasso %>% 
+  group_by(rep, lambda) %>% 
+  summarise(metric = matrix(c(sum(tp),sum(fp),sum(fn),sum(tn)),2,2) %>% mcc)
+
+mcc_lasso # a row for each repetition for each lambda value
+```
+
+To aid plot creation we compute the values of lambda that maximise the score:
+
+```{r}
+# lambda value at best mean MCC estimate
+lambda_best_lasso <- mcc_lasso %>% 
+  group_by(lambda) %>%  
+  summarise(metric = mean(metric)) %>% 
+  filter(metric == max(metric, na.rm = T)) %>% 
+  pull(lambda)
+
+# MCC scores for all reps at best lambda value
+mcc_best_lasso <- mcc_lasso %>% 
+  filter(lambda == lambda_best_lasso) %>%
+  arrange(lambda,rep) %>% pull(metric)
+
+```
+
+To select $\lambda$, we compute the (modified) standard errors
+```{r}
+metric_plot_data <- mcc_lasso %>% 
+  group_by(lambda) %>% 
+  arrange(lambda,rep) %>%
+  summarise(se_ose = sd(metric),
+            se_diff  = sd(metric - mcc_best_lasso),
+            se_best = sd(mcc_best_lasso),
+            rho_best_m = (se_diff^2 - se_ose^2 - se_best^2)/(-2*se_ose*se_best),
+            se_mod = sqrt(1-(rho_best_m))*se_best,
+            metric_diff = mean(metric - mcc_best_lasso),
+            metric = mean(metric))
+
+metric_mod_ose <- metric_plot_data %>% 
+    filter(metric + se_mod > max(metric, na.rm = T)) %>% 
+    filter(lambda == max(lambda))
+
+metric_ose <- metric_plot_data %>% 
+    filter(se_ose >= abs(metric_diff)) %>% 
+    filter(lambda == max(lambda))
+
+
+```
+
+which allows us to plot the tuning results and apply the modified OSE rule:
+
+```{r}
+
+plot_lasso <- 
+  metric_plot_data %>% 
+  ggplot(aes(x = log(lambda))) +
+  geom_vline(aes(xintercept = metric_mod_ose$lambda %>% log), col = "grey70", lty = "dashed") +
+  geom_vline(aes(xintercept = lambda_best_lasso %>% log), col = "grey70", lty = "dashed") +  
+  geom_linerange(aes(ymax = metric + se_mod, ymin = metric -se_mod, col = "m-OSE"), size = 0.5, 
+                 data = metric_mod_ose, position = position_nudge(0.0)) +
+  geom_linerange(aes(ymax = metric + se_ose, ymin = metric - se_ose, col = "OSE"), size = 0.5, 
+                 data = metric_ose, position = position_nudge(0.0)) +
+  geom_point(aes(y = metric), col = "grey60") + 
+  geom_point(aes(y = metric), col = "grey10", data = ~ .x %>% filter(metric == max(metric))) + 
+  geom_line(aes(y = metric), col = "grey30", lty = "solid") + 
+  geom_point(aes(y = metric), shape = 1, size = 6, data = metric_mod_ose, col = "black") +
+  geom_point(aes(y = metric), size = 1, data = metric_mod_ose) +
+  geom_point(aes(y = metric), size = 1, data = ~ .x %>% filter(lambda == lambda_best_lasso), col = "black") +
+  labs(subtitle = NULL, x = NULL, y = "MCC") +
+  scale_colour_manual(name = NULL, values = c("black",blues9[8]), 
+                      labels = c(modOSE = expression(sigma^"diff"),OSE = expression(sigma^"best"))) +
+  theme_classic() +
+  theme(panel.grid = element_blank()) 
+plot_lasso
+```
+
+Note that the ordinary OSE based on $\sigma^{\mathrm{best}}$ selects a more heavily regularised model than the modified OSE based on $\sigma^{\mathrm{mod}}$ (see manuscript for further details). 
+
+To see the effect of $\lambda$ on the parameter estimates we refit the penalised regression models (using all of the data) and plot the corresponding trajectories:
+```{r}
+
+fit_glmnet <- glmnet(x = scat %>% select(-y) %>% as.data.frame() %>% makeX(),
+       y = scat$y,
+       family = "binomial",
+       lambda = exp(log_lambda_lasso),
+       alpha = 1)
+
+plot_est <- fit_glmnet$beta %>% as.matrix %>% t %>% as_tibble() %>% 
+  mutate(lambda = log_lambda_lasso) %>%  #, metric = metric_plot_data$metric) %>% 
+  pivot_longer(!any_of(c("lambda","metric")), values_to = "estimate", names_to = "coefficient") %>% 
+  filter(estimate != 0 | coefficient == "cn") %>% 
+  ggplot(aes(lambda,estimate)) + 
+  geom_vline(aes(xintercept = metric_mod_ose$lambda %>% log), col = "grey70", lty = "dashed") +
+  geom_vline(aes(xintercept = lambda_best_lasso %>% log), col = "grey70", lty = "dashed") +
+  geom_line(aes(col = coefficient)) +
+  geom_point(aes(col = coefficient), size =1, data = ~ .x %>% filter(lambda == metric_mod_ose$lambda %>% log)) +
+  geom_hline(aes(yintercept = 0), lty = "longdash") +
+  labs(y = "Parameter estimates", x = expression(paste("log(",lambda,")"))) +
+  theme_classic() +
+  theme(legend.position = "none")
+
+plot_est
+```  
+
+
+The above code is easily re-used to compute ridge estimates (i.e., $\alpha= 0$), or indeed any other $\alpha$ values within the elastic-net family. 
+
+### Tuning $\alpha$ in elastic-net regression
+
+Finally, to tune $\alpha$ as well as $\lambda$, we can nest the call to `get_cm`:
+
+```{r, include = FALSE}
+metric_alpha <- readRDS("files_scat/metric_alpha_2022_08_29.rds")
+alpha <-seq(0, 1, 0.025)
+```
+
+
+```{r, eval = FALSE}
+
+  alpha <-seq(0, 1, 0.025) # candidate alpha values
+
+  metric_alpha <- lapply(alpha_vec, function(a){
+    pbmclapply(1:nrow(cv_data_1), function(i) get_cm(cv_data_1$splits[[i]], 
+                                                     cv_data_1$id[[i]], 
+                                                     cv_data_1$id2[[i]], 
+                                                     alpha = a, lambda, thresh),
+               mc.cores = MAX_CORES) %>% 
+      bind_rows %>% 
+      group_by(rep, lambda) %>% 
+      summarise(cm11 = sum(tp), cm12 = sum(fp), cm21 = sum(fn), cm22 = sum(tn), .groups = "keep") %>% 
+      summarise(metric = (cm11*cm22 - cm12*cm21)/(sqrt((cm11+cm12)*(cm11+cm21)*(cm22+cm12)*(cm22+cm21))), .groups = "drop") %>% 
+      group_by(lambda) %>%  
+      summarise(metric = mean(metric)) %>% 
+      filter(metric == max(metric, na.rm = T)) %>% 
+      pull(metric) # return best mean metric estimate among all lambda values
+    })
+
+```
+The results suggest that LASSO ($\alpha=1$) and ridge ($\alpha=0$) have comparable performance, whereas the elastic net estimate $\alpha = 0.175$ is clearly superior:
+```{r}
+  tibble(metric = metric_alpha %>% unlist, alpha = alpha) %>% 
+    ggplot(aes(alpha,metric)) + geom_line() + theme_classic() +
+    geom_point(data = ~ .x %>% filter(metric == max(metric))) +
+    labs(subtitle = "Tuning alpha for elastic-net regularisation", y = "MCC")
+
+```
+
+<br><br><br>
+
+## Part 2: Regularising priors and Bayesian projective inference
+
+### Reference model
+
+In a Bayesian setting, lasso-type and ridge-type regression can be implemented by an appropriate choice of prior distribution. The direct analogue of the frequentist lasso is the Laplacian (two-sided exponential) prior (Hastie2015), and Gaussian priors are equivalent to ridge regression. An alternative choice is the regularised horseshoe prior, which provides support for a proper subset of parameters to be far from zero, using prior information to guide both the number and the degree of regularisation of the non-zero parameter estimates.
+
+Here we fit three models, using a different regularising prior for each, and we compare their predictive performance using pareto-smoothed-importance-sampling (PSIS) leave-one-out (LOO) CV---an easily computed approximate CV method for use with fitted Bayesian models. The three models are:  
+
+1. uniform prior (improper),
+2. weakly-informative Gaussian priors (i.e., weak ridge-type regression),
+3. Laplacian priors (i.e., LASSO), and  
+4. regularised horseshoe priors.
+
+
+We fit the models using the package $\texttt{brms}$: a front-end for the $\texttt{stan}$ engine which implements cutting-edge Hamiltonian Monte Carlo (HMC) Markov chain methods combined with no u-turn sampling (NUTS) for fast efficient model fitting. 
+
+
+```{r, eval = FALSE}
+  fit.flat <- brm(y ~ ., family=bernoulli(), 
+                   data=scat, chains=4, iter=2000, cores = 4,
+                   save_pars = save_pars(all = TRUE))
+
+  fit.ridge <- brm(y ~ ., 
+                   family = bernoulli(), 
+                   prior = prior(normal(0,10)), 
+                   data = scat, 
+                   chains = 4, 
+                   iter = 2000, 
+                   cores = 4)
+
+  fit.lasso <- brm(y ~ ., 
+                   family = bernoulli(), 
+                   data = scat,
+                   prior = set_prior("lasso(1)"),
+                   chains = 4, 
+                   iter = 2000, 
+                   cores = 4)
+
+  fit.hs <- brm(y ~ ., family=bernoulli(), data=scat,
+                  prior=prior(horseshoe(scale_global = tau0, scale_slab = 1), class=b),
+                  chains=4, iter=2000, cores = 4)
+  
+```
+
+The models took about half a minute to compile, but less than 2 seconds to sample. 
+```{r, include = FALSE}
+library(brms)
+library(projpred)
+source("scat_funs.R")
+fit.flat <- readRDS("files_scat/fit.flat.rds")
+fit.ridge <- readRDS("files_scat/fit.ridge.rds")
+fit.lasso <- readRDS("files_scat/fit.lasso.rds")
+fit.hs <- readRDS("files_scat/fit.hs.rds")
+fits.loo <- readRDS("files_scat/fits.loo.rds")
+vs <- readRDS("files_scat/vs.hs.rds")
+fit.cn <- readRDS("files_scat/fit.cn.rds")
+cv_data_2 <- readRDS("files_scat/cv_data_2.rds")
+mcc_plot_data_2 <- readRDS("files_scat/mcc_plot_data_2.rds")
+```
+
+Combining the model into a list, we run PSIS-LOO and compare the results:
+```{r}
+fits <- list(hs = fit.hs, lasso = fit.lasso, ridge = fit.ridge, flat = fit.flat)
+fits %>% map(loo, cores = 10) %>% loo_compare()
+```
+
+Although the LOO scores have been estimated for all four models, the `pareto_k >0.7` diagnostic tell us that the LOO approximation may have failed for a few data points in the less regularised models. To address this, we refit (`reloo = T`) the model for each problematic observation; i.e., manually leaving out test points:
+
+```{r, eval = FALSE}
+future::plan("multisession", workers = 10)
+fits.loo <- fits %>% map(loo, reloo = T, future = T)
+```
+
+Using the future package for parallelisation, the models are quickly fit, giving the adjusted summary
+```{r}
+fits.loo %>% loo_compare
+```
+
+The horseshoe model is the best performing of the models and it also the most regularised. The degree of regularisation can be seen by comparing the effective number of parameters (`p_loo`) between models:
+```{r}
+fits.loo %>% loo_compare %>% print(simplify = F)
+```
+
+It is interesting to 'see' the effect of the regularising priors by examining the (marginal) posterior density plots. 
+
+```{r, warning=F, fig.height=10, message = F}
+library(bayesplot)
+# plot posteriors 
+plot_post <- function(fit){
+  fit %>% as_tibble %>% select(-starts_with("l")) %>% 
+    mcmc_areas(area_method = "scaled", prob_outer = 0.98) +
+    xlim(c(-2.8,2)) +
+    theme_classic()
+}
+
+ggpubr::ggarrange(
+  fit.flat %>% plot_post + labs(subtitle = "Uninformative (flat)"), 
+  fit.ridge %>% plot_post + labs(subtitle = "Weakly informative (ridge)"),
+  fit.lasso %>% plot_post + labs(subtitle = "LASSO"),
+  fit.hs %>% plot_post + labs(subtitle = "Horseshoe"),
+  ncol = 1,
+  labels = "AUTO"
+) 
+
+
+```
+
+### Projective Inference
+
+Having specified, fit, and compared the candidate reference models, the predictive-inference step is easily implemented using the $\texttt{projpred}$ package. Taking the horseshoe variant as the best available reference model, we use cross-validated forward step selection.
+
+```{r, eval = F}
+library(projpred)
+vs <- cv_varsel(fit.hs, cv_method = "LOO", method = "forward")
+```
+```{r}
+vs %>% 
+  plot(stats = c("elpd"), deltas = T) + 
+  theme_classic() +
+  theme(strip.text = element_blank(),
+        strip.background = element_blank(),
+        legend.position = "none") +
+  labs(y = expression(Delta*"ELPD"))
+
+solution_terms(vs)
+```
+
+The one-predictor model (`cn`) is an obvious choice and its selection is what we would have expected after seeing the posterior distribution of the reference model. The last step in the BPI process is to project posterior of the reference model onto the selected submodel (here, using all 4000 draws):
+
+```{r}
+proj <- project(vs, nterms = 1, ndraws = 4000)
+```
+To see the effect of the projection, we first fit the same one-parameter submodel to the original data set (as if we had decided *a priori* that this was the preferred model)
+
+```{r, eval = F}
+fit.cn <- brm(y ~ cn, family=bernoulli(), data=scat,chains=4, iter=2000, cores = 4)
+```
+Finally, we plot the (marginal) posteriors of the `cn` parameter for the reference (ref), projected (proj) and non-projected (non-proj) models
+```{r, eval = T}
+  tibble(ref = fit.hs %>% as_tibble() %>% pull(b_cn),
+       proj = proj %>% as.matrix %>% {.[,"b_cn"]},
+       `non-proj` = fit.cn %>% as_tibble() %>% pull(b_cn)) %>% 
+  mcmc_areas() +
+  labs(x = expression(theta["carbon-nitrogen ratio"])) +
+  theme_classic()
+```
+
+
+The larger effect size of the non-projected model can be interpreted as a selection-induced bias, arising due to a failure to account for selection uncertainty.
+
+
+## Part 3: Nested CV to compare logistic and random forests models
+
+In this section we illustrate nested CV. Comparing parametric models to 'black-box' machine-learning models is not commonly done and for our choice of metric, MCC, the implementation requires some custom functions. Rather than show all of the gory details, we source a separate script and outline the basic steps (see GitHub repo for the script).
+
+To get started, we generate the nested data splits using the $\texttt{rsample}$ package
+
+```{r, eval = F}
+set.seed(7193) # sample(1e4,1)
+cv_data_2 <- nested_cv(scat, outside = vfold_cv(v = 10, repeats = 50), inside = vfold_cv(v = 10))
+vars <- names(scat %>% select(-y)); vars
+```
+
+The generated data-splitting scheme is 10-fold CV repeated 50 times (for the outer layer), where each of these 500 training sets contains a second (inner) layer of 10-fold CV splits---there are 5000 inner training sets altogether. The inner splits (training and test) are used to tune the hyperparameters of the model for each separate training set. Each tuned model is then fit to corresponding outer training set after which prediction to the test set and loss calculations are performed in the usual manner. 
+
+We load the pre-written functions and perform parameter tuning first. Random forest models require the number of trees (`ntree`) to be set and the tree depth (`mtry`): the latter is a hyperparameter that we will tune
+
+```{r, eval = F}
+source("files_scat/scat_funs.R")
+
+# specify RF hyper-parameters
+ntree <- 500 # set a fixed value
+mtry_vec <- 1:(ncol(scat)-1)  # candidate tree-depth values
+
+# run the tuning functions
+rf_tune_values <- tune_rf(cv_data_2, mtry_vec, ntree, metric = mcc)  # 1:17 seconds for 50 repeats with 40 cores
+glm_step_tune_values <- tune_glm_step(cv_data_2, vars, metric = mcc) # 1:40 seconds for 50 repeats with 40 cores
+
+# add tuned hyperparameters values to the rsample object
+cv_data_2$thresh_rf <- rf_tune_values$threshold
+cv_data_2$thresh <- glm_step_tune_values$threshold
+cv_data_2$mtry_rf <- rf_tune_values$mtry
+cv_data_2$form_glm <- glm_step_tune_values$form
+```
+
+Let's have look at the `rsample` object with tuned values added:
+
+```{r}
+cv_data_2
+```
+
+
+Now fit the models, which is much faster than tuning as we are only using the 500 outer folds. For the random forest models, we fit two alternatives: 1) only the subset most important (best) predictors is kept for each fold (keeping `mtry` predictors in total) 2) all predictors are kept, but the tuned `mtry` values are still used for fitting.
+
+```{r, eval = F}
+  fits_rf_best <- fit_rf(cv_data_2, ntree = ntree, type = "best", metric = mcc) # 3 seconds with 40 cores
+  fits_rf_all<- fit_rf(cv_data_2, ntree = ntree, type = "all", metric = mcc) # 2 seconds with 40 cores
+  fits_glm_step <- fit_confusion_glm(cv_data_2, metric = mcc)
+```  
+
+
+Finally we collate and prepare the results
+
+```{r, eval = F}
+mcc_data_2 <- tibble(glm_step = fits_glm_step$metric,
+                     rf_best = fits_rf_best$metric,
+                     rf_all = fits_rf_all$metric)
+
+mcc_plot_data_2 <- make_plot_data(mcc_data_2, names(tss_data_2))
+
+```
+
+and plot the model-comparison figure
+
+```{r}
+
+plot_model_comparisons(mcc_plot_data_2, "se_mod") +
+  labs(title = "Model comparison", subtitle = "Stage 2: nested CV with tuned hyper-parameter, score = MCC")
+```
+
+The random forest model is a better predictive model than the glm, with the best subset model the better performer of the two random forest variants. Interestingly, the tuned tree depth across 500 outer folds varied uniformly across the range of possible values (1 - 10), suggesting that other predictors (not just `cn`) do add value, but the linearity of the glm may have been too inflexible for their inclusion to be useful.
+
+```{r}
+# table of number of variable selected across 500 outer folds
+cv_data_2$mtry_rf %>% table # random forest
+cv_data_2$form_glm_step %>% str_split(" +") %>% map_dbl(~ .x %in% vars %>% sum) %>% table # glm
+
+```
+
+
+## Session Information
+
+```{r} 
+sessionInfo()
+```
+
+

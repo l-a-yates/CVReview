@@ -1,0 +1,441 @@
+---
+title: "Example 2: Pinfish growth"
+author: "Luke Yates"
+date: "03/02/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse); library(tidymodels); library(kableExtra); library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+select <- dplyr::select
+options(na.action = "na.fail") # for MuMIn::dredge
+```
+## Overview
+This page is part of a [code repository](https://github.com/l-a-yates/CVReview) to reproduce the example analyses in the manuscript  "Cross validation for model selection: a primer with examples from ecology" by L.A. Yates, Z. Aandahl, S.A.Richards, and B.W.Brook (2022). This tutorial is designed to be used alongside the manuscript.  
+
+The `pinfish` dataset is sourced from the R package `fishmethods` and contains length, age and sex data for pinfish (*Lagodon rhomboides*) from Tampa Bay, Florida. The aim of the analysis is to determine which allometric growth function best describes the relationship between the available ${\sf length}$ and ${\sf age}$ measurements of pinfish, while accounting for the effect of {\sf sex} and {\sf haul} on the model parameters (the processed data comprise measurements from 45 separate fishery hauls). We fit all models in Bayesian framework using Markov Chain Monte Carlo (MCMC) sampling as implemented in the R package $\texttt{brms}$
+
+## Load and prepare pinfish data
+
+Data preparations include: removing observations with unknown sex, setting a minimum haul size, and removing one outlier. These preparations are made to simplify the analysis so we can focus on model-selection aspects, but it would be possible to retain all of these data predicting to unknown sex and small hauls using the grand mean in lieu of group-level predictions and using robust regression to deal with outliers. 
+
+
+```{r}
+library(fishmethods)
+
+data(pinfish) # 670 obs
+names(pinfish)[1] <- "haul"
+
+# remove samples with undetermined sex
+fishData <- pinfish %>% filter(sex != 0) %>% mutate(sex = factor(sex)) %>% as_tibble
+
+# restrict minimum haul size
+fishData %>% group_by(haul) %>% summarise(n = n()) %>% pull(n) %>% table() 
+min.size <- 5 # set minimum haul size
+fishData <- fishData %>% group_by(haul) %>% filter(n()>= min.size) %>% ungroup
+
+# remove outlier
+fishData <- fishData %>% filter(haul != "TBD930066") %>% mutate(haul = factor(haul)) 
+
+fishData 
+```
+
+## Specify and fit models
+
+We take as candidate growth models the following commonly used non-linear functions:
+
+\begin{equation}
+    \begin{array}{ll}
+    \mbox{Gompertz (G)} &L_{\mathrm{G}}(a) = L_0 e^{-e^{(-K(a - t_0))}}\\
+    \mbox{logistic (log)} &L_{\mathrm{log}}(a) = {L_0}/(1 + e^{-K(a - t_0)})\\
+    \mbox{von Bertalanffy (vB)} \qquad\qquad 
+    &L_{\mathrm{vB}}(a) = L_0(1 - e^{-K(a - t_0)}),
+    \end{array}
+\end{equation}
+
+To implement these in $\texttt{R}$, we 'hard-code' initial values for the parameters $L_0=$`Linf` and $K$; these starting values aid the MCMC sampling by allowing narrower priors. An equivalent approach would be to use these values as the means of the corresponding prior distributions; non-linear models generally require more informative priors than linear models, requiring some amount of trial and error or empirical-Bayes methods to establish a convergent model.
+
+```{r}
+# non-linear growth functions
+nlf.G <- sl~ (152 + Linf) * exp(-exp(-(1.3 + K) * (age - t0)))
+nlf.log <- sl ~ (152 + Linf)/(1 + exp(-(1.3 + K) * (age - t0)))
+nlf.vB <- sl ~ (152 + Linf) * (1 - exp(-1*((1.3 + K) * (age - t0))))
+```
+
+We write functions to generate the model formulas and priors so that we can easily iterate of the 24 model variants (see manuscript for model details).
+
+```{r model functions, message=F}
+library(brms)
+
+# specify brms formula
+make_form <- function(fun, K, t, L) {
+  if(K) {f.K <- K ~ sex} else {f.K <- K ~ 1}
+  if(t) {f.t <- t0 ~ sex} else {f.t <- t0 ~ 1}
+  if(L) {f.L <- Linf ~ sex + (1|haul)} else {f.L <- Linf ~ 1 + (1|haul)}
+  bf(get(paste0("nlf.",fun)), f.K, f.t, f.L, nl = T)
+}
+
+# specify priors
+make_prior <- function(K, t, L, sig_Linf = 10, sig_sex2 = 0.3){
+  p <-  
+    prior(normal(0, 1), nlpar = "K") +  
+    prior(student_t(3, 0, 10), nlpar = "Linf", class = "sd") +
+    prior(normal(0, 1), nlpar = "t0") +
+    set_prior(paste0("normal(0, ",sig_Linf,")"), nlpar = "Linf")
+  if(K) p <-  p + set_prior(paste0("normal(0, ",sig_sex2,")"), nlpar = "K", coef = "sex2") 
+  if(t) p <-  p + set_prior(paste0("normal(0, ",sig_sex2,")"), nlpar = "t0", coef = "sex2") 
+  if(L) p <-  p + set_prior(paste0("normal(0, ",sig_sex2,")"), nlpar = "Linf", coef = "sex2") 
+  return(p)
+}
+```
+
+The model variants are stored in a grid, characterised by the growth function and fixed-effects structure.
+
+```{r model set}
+# characterise model set
+models_grid <- expand.grid(fun = c("vB","G","log"), K = c(0,1), L = c(0,1), t  = c(0,1), stringsAsFactors = F) %>% 
+  mutate(fe = paste0(ifelse(K,"K",""),ifelse(L,"L",""),ifelse(t,"t",""), ifelse(K + L + t, "","0")),
+         name = paste0(fun,".",fe),
+         dim = K + L + t)
+
+models_grid
+```
+
+For example, the model formula and priors for first model, `vB.0` is:
+```{r}
+with(models_grid[1,], make_form(fun,K,t,L))
+with(models_grid[1,], make_prior(K,t,L))
+
+```
+
+We fit the models in parallel, allocating each model to a single core for simultaneous evaluation. All of the models fit in about 2-3 minutes
+
+```{r fit models, eval = F}
+  library(future)
+  seed <- 60869 #sample(1e5,1)
+  m.fits <- list()
+  plan(multisession(workers = 24))
+  for(i in 1:nrow(models_grid)){
+    print(paste("Fitting model", i, models_grid[i,"name"])) 
+    m.fits[[models_grid[i,"name"]]] <- futureCall(brm, args = list(formula = with(models_grid[i,], make_form(fun,K,t,L)),
+                                                              prior = with(models_grid[i,], make_prior(K,t,L)),
+                                                              data = fishData,
+                                                              future = F,
+                                                              chains = 4,
+                                                              seed = seed,
+                                                              iter = 4000),
+                                             seed = T,
+                                             earlySignal = T
+    )
+  }
+```
+
+For a quick initial check of model convergence, we look at the mean $\widehat{R}$ values:
+  
+```{r rhat inital, eval = F}
+  m.fits %>% map_dbl(~ .x %>% rhat() %>% map_dbl(mean) %>% mean)
+```
+
+```{r, echo = F}
+readRDS("files_fish/rhat_initial.rds")
+```
+  
+  
+There are two models, `vB.Kt` and `vB.KLt`, that have $\widehat{R}>1.1$, suggesting they have not converged. We refit them with narrow priors to see if this helps
+
+```{r refit, eval = F}
+  vB.KLt_update <-  m.fits$vB.KLt %>% 
+    update(cores = 4, inits = "0", seed = seed, prior = make_prior(1,1,1,sig_Linf = 5, sig_sex2 = 0.2))
+  vB.Kt_update <- m.fits$vB.Kt %>% 
+    update(cores = 4, inits = "0", seed = seed, prior = make_prior(1,1,0,sig_Linf = 5, sig_sex2 = 0.2)
+           
+  vB.KLt_update %>% rhat %>% mean
+  vB.Kt_update %>% rhat %>% mean
+```
+
+```{r , echo = F}
+1.002192; 1.00022
+```
+
+The new fits have acceptable $\widehat{R}$ values so we will proceed with assessment of predictive scores based on approximate cross validation. The diagnostics associated with these assessments can identify further issues with model misspecification, and the selected model should also be subject to validation checks and the visual inspection of chains.
+
+## Cross validation
+To evaluate model performance from both conditional and marginal perspectives, we implement both pointwise and leave-one-group-out (LOGO) CV strategies.
+
+### Conditional focus
+For the conditional focus, we compute Pareto-smoothed importance sampling (PSIS) leave-one-out (LOO) approximate cross validation, using the function `loo` provided via the package with the same name. 
+
+```{r load loo, include = F}
+m.loo <- readRDS("files_fish/m.loo.rds")
+m.logo <- readRDS("files_fish/m.logo.rds")
+```
+
+
+```{r psis loo, eval = F}
+# still using 24 cores
+m.loo <- m.fits %>% furrr::future_map(loo)
+```
+
+The `pareto_k` diagnostic assess the validity of LOO approximations: all pointwise `pareto_k` values should be less than 0.7.
+
+```{r pareto_k}
+m.loo %>% map("diagnostics") %>% map("pareto_k") %>% map_dbl(~ sum(.x>0.7))
+```
+
+The approximations are valid. 
+
+### Marginal focus
+
+For the marginal focus, we use $K$-fold CV, manually leaving out one haul at a time.
+
+```{r logo, eval = F}
+  plan(multisession(workers = 45)) # one core per haul
+  m.logo <- lapply(m.fits, kfold, chains = 2, future = T, group = "haul")
+```
+
+Since we are refitting the model for each split of the data, there are no diagnostics to evaluate.
+
+### Plots of CV estimates: model selection
+
+To organise and generate plots of the CV estimates we write a function to compute summary statistics of the LOO estimates and we reorder our model grid by function type and dimension
+
+```{r}
+make_plot_data <- 
+  function(metric_data, levels = names(metric_data)){
+    best_model <- metric_data %>% map_dbl(mean) %>% which.max() %>% names()
+    tibble(model = factor(names(metric_data), levels = levels), 
+    metric = metric_data %>% map_dbl(mean),
+    metric_diff = metric - max(metric),
+    se = metric_data %>% map_dbl(~ .x %>% {sd(.)/sqrt(length(.))}),
+    se_diff = metric_data %>% map(~ .x - metric_data[[best_model]]) %>% map_dbl(~ .x %>% {sd(.)/sqrt(length(.))}),
+    se_mod = sqrt(1 -cor(metric_data)[best_model,])*se[best_model])
+  }
+
+models_grid <- models_grid %>% arrange(fun,dim)
+```
+
+### Conditional plot
+
+We extract and organise the PSIS-LOO estimates
+
+```{r}
+loo_pointwise <- 
+  m.loo %>% 
+  map("pointwise") %>% 
+  map_dfc(~ .[,"elpd_loo"]) %>% 
+  relocate(all_of(models_grid$name))
+
+se_type <- "se_mod"
+
+loo_df <- 
+  make_plot_data(loo_pointwise) %>%
+  mutate(fe = factor(models_grid$fe, levels = models_grid$fe[1:8]),
+                   fun = models_grid$fun,
+                   dim = models_grid$dim,
+                   se_ose = se,
+                   se = .[[se_type]])
+
+loo_ose_models <- loo_df %>% filter(metric + se >= max(metric)) %>% filter(dim == min(dim))
+fun_labels = c(G = "Gompertz", log = "logistic", vB = "von Bertalanffy")
+```
+
+and generate the plot:
+
+```{r conditional plot}
+loo_df %>% 
+  ggplot(aes(x = fe)) +
+  geom_point(aes(y = metric_diff, col = fun), size = 2, show.legend = F) +
+  geom_linerange(aes(ymin = metric_diff - se, ymax = metric_diff + se, col = fun), show.legend = F) +
+  theme_classic() +
+  theme(strip.placement = "outside", panel.border = element_blank(), 
+        strip.background = element_rect(), axis.ticks.x = element_blank(),
+        strip.text = element_text(size = 8), strip.background.x = element_rect(linetype = 0, fill = "grey90"),
+        axis.title.y = element_text(size = 8)) +
+  facet_wrap(~fun,nrow = 1, strip.position = "bottom", labeller = labeller(fun = fun_labels)) +
+  geom_point(aes(y = metric_diff), shape = 1, size = 4, col = "black", data = loo_ose_models) +
+  scale_color_brewer(type = "div", palette = "Dark2")+
+  scale_y_continuous(labels=function(x)x*1000, limits = c(-0.022,0.002)) +
+  labs(x = NULL, subtitle = "Pinfish PSIS-LOO estimates", y =  expression(Delta*"ELPD "~group("(", 10^- 3,")")))
+```
+
+See the caption and text in the manuscript for interpretation.
+
+### Marginal plot
+
+We extract and organise the LOGO CV estimates
+```{r}
+logo_pointwise <- 
+  m.logo %>% 
+  map("pointwise") %>% 
+  map_dfc(~ .[,"elpd_kfold"]) %>% 
+  relocate(all_of(models_grid$name))
+
+se_type <- "se_mod"
+
+logo_df <- make_plot_data(logo_pointwise) %>% 
+  mutate(fe = factor(models_grid$fe, levels = models_grid$fe[1:8]),
+         fun = models_grid$fun,
+         dim = models_grid$dim,
+         se_ose = se,
+         se = .[[se_type]])
+
+logo_ose_models <- logo_df %>% filter(metric + se >= max(metric)) %>% filter(dim == min(dim))
+fun_labels = c(G = "Gompertz", log = "logistic", vB = "von Bertalanffy")
+```
+
+and generate the plot:
+
+```{r marginal plot, message=F}
+logo_df %>%
+  filter(metric_diff > -0.012) %>% 
+  ggplot(aes(x = fe)) +
+  #geom_line(aes(y = metric_diff, group = fun), col = "grey40", lty = "dashed", show.legend = F) +
+  geom_point(aes(y = metric_diff, col = fun), size = 2, show.legend = F) +
+  geom_linerange(aes(ymin = metric_diff - se, ymax = metric_diff + se, col = fun), show.legend = F) +
+  theme_classic() +
+  theme(strip.placement = "outside", panel.border = element_blank(), 
+        strip.background = element_rect(), axis.ticks.x = element_blank(),
+        strip.text = element_text(size = 8), strip.background.x = element_rect(linetype = 0, fill = "grey90"),
+        axis.title.y = element_text(size = 8)) +
+  facet_wrap(~fun,nrow = 1, strip.position = "bottom", labeller = labeller(fun = fun_labels)) +
+  geom_point(aes(y = metric_diff), shape = 1, size = 4, col = "black", data = logo_ose_models) +
+  scale_color_brewer(type = "div", palette = "Dark2")+
+  scale_y_continuous(labels=function(x)x*1000, limits = c(-0.012,0.002)) +
+  labs(x = NULL, subtitle = "Pinfish LOGO estimates", y =  expression(Delta*hat(S)*" "~group("(", 10^{- 3},")")))
+```
+
+See the caption and text in the manuscript for interpretation.
+
+
+## Plots of model predictions
+
+### Conditional plot
+
+Load the selected model
+
+```{r, eval = F}
+m.vB.0 <- m.fits$vB.0
+```
+```{r, include = F}
+m.vB.0 <- readRDS("files_fish/m.vB.0.rds")
+```
+
+With a little effort we generate plot data for the conditional effects,
+
+```{r ce, message=F}
+# von Bertalanffy growth function
+g.vB <- function(age, Linf, K, t0) (152 + Linf) * (1 - exp(-1*((1.3 + K) * (age - t0))))
+
+# list of hauls
+hauls <- m.vB.0$data$haul %>% unique
+
+# set range of age values
+ce_data <- hauls %>% map_dfr(~ tibble(age = seq(0.5,6.3,0.04), haul = .x))
+
+# extract and tidy posterior draws
+ps.0 <- 
+  m.vB.0 %>% 
+  as_tibble %>%
+  rename_with(~ str_replace(.x, "r_haul__Linf\\[","")) %>% 
+  rename_with(~ str_replace(.x, ",Intercept\\]",""), ends_with("Intercept]")) %>% 
+  rename(K = b_K_Intercept, t0 = b_t0_Intercept, Linf0 = b_Linf_Intercept, tau = sd_haul__Linf_Intercept) %>% 
+  select(-lp__) %>% sample_n(500) %>% mutate(sample = 1:500)
+
+# create long-form data frame of posterior simulated data
+ce_plot_data <- 
+  ps.0 %>% 
+  pivot_longer(-any_of(c("sigma","tau","sample","K","Linf0","t0")),
+               names_to = "haul", values_to = "Linf_haul") %>% 
+  mutate(Linf = Linf0 + Linf_haul) %>% 
+  full_join(ce_data, by = "haul") %>% 
+  group_by(sample) %>% 
+  mutate(sig_err = rnorm(1,0,mean(sigma))) %>%  ## generate residual error
+    mutate(length_e = g.vB(age,Linf,K,t0), # expected length
+         length = length_e + sig_err) %>% 
+  group_by(haul) %>% 
+  mutate(haul_col = mean(Linf) + 152) # haul colour index for plots
+
+# match haul colours to observed data
+obs_data <- 
+  m.vB.0$data %>% 
+  left_join(ce_plot_data %>% 
+              select(haul, haul_col) %>% 
+              distinct, 
+            by = "haul")
+```
+
+```{r}
+ce_plot_data %>% 
+  group_by(haul_col,age) %>% 
+  summarise(length = mean(length_e)) %>% 
+  ggplot(aes(x = age)) +
+  #geom_ribbon(aes(ymin = l_low, ymax = l_hi), fill = "black", alpha = 0.1, data = ribbon_data) +
+  geom_line(aes(y = length, group = haul_col, col = haul_col), size = 0.25, alpha = 0.4) +
+  geom_point(aes(y = sl, group = haul_col, col = haul_col), size = 0.5, alpha = 1, data = obs_data) +
+  theme_classic() +
+  theme(legend.position = "none", legend.key.height =  unit(5,"mm")) 
+```
+
+
+### Marginal plot
+Load selected model
+```{r, eval = F}
+m.log.0 <- m.fits$log.0
+```
+```{r, include = F}
+m.log.0 <- readRDS("files_fish/m.log.0.rds")
+```
+
+As above, we extract posterior samples and simulate new data to generate the conditional effects plots,
+
+```{r}
+# logistic growth function
+g.log.0 <- function(age, Linf, K, t0) (152 + Linf)/(1 + exp(-(1.3 + K) * (age - t0)))
+
+# set range of age values
+ce_data <-tibble(age = seq(0.5,6.3,0.04), J = 1)
+
+# extract and tidy posterior draws
+ps.0 <- 
+  m.log.0 %>% 
+  as_tibble %>% 
+  select(K = b_K_Intercept, 
+         t0 = b_t0_Intercept, 
+         Linf0 = b_Linf_Intercept, 
+         tau = sd_haul__Linf_Intercept, 
+         sigma) %>% 
+  sample_n(500) %>% 
+  mutate(sample = 1:500)
+
+# create long-form data frame of posterior simulated data
+ce_plot_data <- 
+  full_join(ps.0 %>% mutate(J = 1), ce_data, by = "J") %>% 
+  group_by(sample) %>% 
+  mutate(sig_err = rnorm(1,0,mean(sigma))) %>%  ## draw from residual error model
+  mutate(tau_err = rnorm(1,0,mean(tau))) %>% ## draw from hierarchical distribution for Linf
+  mutate(length = g.log.0(age,Linf0 + tau_err,K,t0) + sig_err,
+         length_e = g.log.0(age,Linf0,K,t0)) # expected length
+
+# main plot
+ce_plot_data %>% 
+  group_by(age) %>% 
+  summarise(l_low = quantile(length, 0.025),
+            l_hi = quantile(length, 0.975),
+            length = mean(length_e)) %>% 
+  ggplot(aes(x = age)) +
+  geom_ribbon(aes(ymin = l_low, ymax = l_hi), fill = blues9[3], alpha = 0.4) +
+  geom_line(aes(y = length), size = 0.7, col = blues9[9], lty = "solid") +
+  geom_point(aes(y = sl), size = 0.4, alpha = 1, data = m.log.0$data) +
+  #geom_point(aes(y = sl), size = 0.3, alpha = 1, col = "white", data = m.vB.0$data) +
+  theme_classic() +
+  theme(legend.position = "none", legend.key.height =  unit(10,"mm"))
+
+```
+
+
+## Session Information
+
+```{r} 
+sessionInfo()
+```
